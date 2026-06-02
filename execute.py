@@ -12,6 +12,10 @@ from sklearn.ensemble import RandomForestRegressor
 
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 
+import matplotlib
+import matplotlib.pyplot as plt
+import seaborn as sns
+import scipy.stats as stats
 
 pd.set_option("display.max_columns", None)
 pd.set_option("display.width", 200)
@@ -57,9 +61,122 @@ df = df[
     (df["price_per_m2_million"] <= 500)
 ].copy()
 
-print("Cleaned dataset shape:", df.shape)
+# Remove exact duplicate listings 
+exact_duplicate_cols = [
+    "area_m2",
+    "district",
+    "ward",
+    "latitude",
+    "longitude",
+    "bedrooms",
+    "bathrooms",
+    "price_billion"
+]
 
-#Fix data types and missing values
+exact_duplicate_cols = [col for col in exact_duplicate_cols if col in df.columns]
+
+before_exact_duplicate_removal = len(df)
+exact_duplicate_percentage = exact_duplicate_count / before_exact_duplicate_removal * 100
+
+df = df.drop_duplicates(subset=exact_duplicate_cols, keep="first").copy()
+
+after_exact_duplicate_removal = len(df)
+
+print("Exact duplicate columns:", exact_duplicate_cols)
+print(f"Exact duplicate percentage: {exact_duplicate_percentage:.2f}%")
+print("Cleaned dataset shape after exact duplicate removal:", df.shape)
+
+
+df["price_log"] = np.log1p(df["price_billion"])
+df["area_log"] = np.log1p(df["area_m2"])
+
+fig, axes = plt.subplots(4, 2, figsize=(16, 24))
+
+sns.histplot(df["price_billion"], bins=40, kde=True, ax=axes[0, 0])
+axes[0, 0].set_title("Original Price Distribution")
+axes[0, 0].set_xlabel("Price (billion VND)")
+
+sns.histplot(df["price_log"], bins=40, kde=True, ax=axes[0, 1])
+axes[0, 1].set_title("Log-Transformed Price Distribution")
+axes[0, 1].set_xlabel("log(Price)")
+
+sns.histplot(df["area_m2"], bins=40, kde=True, ax=axes[1, 0])
+axes[1, 0].set_title("Original Area Distribution")
+axes[1, 0].set_xlabel("Area (m²)")
+
+sns.histplot(df["area_log"], bins=40, kde=True, ax=axes[1, 1])
+axes[1, 1].set_title("Log-Transformed Area Distribution")
+axes[1, 1].set_xlabel("log(Area)")
+
+sns.boxplot(y=df["price_billion"], ax=axes[2, 0])
+axes[2, 0].set_title("Price Boxplot")
+
+sns.boxplot(y=df["area_m2"], ax=axes[2, 1])
+axes[2, 1].set_title("Area Boxplot")
+
+sns.scatterplot(
+    x=df["area_m2"],
+    y=df["price_billion"],
+    alpha=0.5,
+    ax=axes[3, 0]
+)
+
+axes[3, 0].set_title("Area vs Price")
+axes[3, 0].set_xlabel("Area (m²)")
+axes[3, 0].set_ylabel("Price (billion VND)")
+
+numeric_cols = [
+    "price_billion",
+    "area_m2",
+    "bedrooms",
+    "bathrooms",
+    "price_per_m2_million"
+]
+
+numeric_cols = [col for col in numeric_cols if col in df.columns]
+
+if len(numeric_cols) > 1:
+
+    corr = df[numeric_cols].corr()
+
+    sns.heatmap(
+        corr,
+        annot=True,
+        cmap="coolwarm",
+        fmt=".2f",
+        ax=axes[3, 1]
+    )
+
+    axes[3, 1].set_title("Correlation Matrix")
+
+plt.tight_layout()
+
+plt.savefig("eda_combined.png", dpi=200, bbox_inches="tight")
+
+plt.close()
+
+# Check for missing values after cleaning
+missing_values = df.isnull().sum()
+missing_percent = 100 * missing_values / len(df)
+missing_table = pd.DataFrame({"Missing Count": missing_values, "Missing %": missing_percent})
+missing_table = missing_table[missing_table["Missing Count"] > 0].sort_values("Missing %", ascending=False)
+if not missing_table.empty:
+    print("\nMissing values after cleaning:")
+    print(missing_table)
+else:
+    print("\nNo missing values found after cleaning.")
+
+# Categorical feature analysis
+categorical_cols = ["district", "legal_document", "furnishing", "property_status"]
+for col in categorical_cols:
+    if col in df.columns:
+        print(f"\nTop 10 most frequent values in '{col}':")
+        print(df[col].value_counts().head(10))
+        
+        # Average price per category
+        avg_price_cat = df.groupby(col)["price_billion"].mean().sort_values(ascending=False).head(10)
+        print(f"\nAverage price by '{col}' (top 10):")
+        print(avg_price_cat)
 
 categorical_columns = [
     "district",
@@ -104,7 +221,6 @@ for col in numeric_columns:
     if col in df.columns:
         df[col] = pd.to_numeric(df[col], errors="coerce")
 
-#Define feature sets
 
 basic_features = [
     "area_m2",
@@ -138,7 +254,6 @@ enhanced_features = [
     "has_near_center"
 ]
 
-#Define models
 
 models = {
     "Linear Regression": LinearRegression(),
@@ -146,7 +261,6 @@ models = {
     "Random Forest": RandomForestRegressor(n_estimators=300, random_state=42, n_jobs=-1)
 }
 
-#Preprocessing pipeline
 
 def get_feature_types(X):
     numerical_features = []
@@ -183,6 +297,7 @@ def build_preprocessor(X):
 
     return preprocessor, numerical_features, categorical_features
 
+
 #Train and evaluate function
 
 def evaluate_models(dataframe, features, feature_set_name):
@@ -191,7 +306,7 @@ def evaluate_models(dataframe, features, feature_set_name):
     X = dataframe[features].copy()
     X = X.replace({pd.NA: np.nan})
 
-    y = dataframe["price_billion"].copy()
+    y = np.log1p(dataframe["price_billion"].copy())
 
     X_train, X_test, y_train, y_test = train_test_split(
         X, y, test_size=0.2, random_state=42
@@ -222,12 +337,13 @@ def evaluate_models(dataframe, features, feature_set_name):
 
         # Train
         pipeline.fit(X_train, y_train)
-        y_pred = pipeline.predict(X_test)
-        y_pred = np.maximum(y_pred, 0)
+        y_pred_log = pipeline.predict(X_test)
+        y_pred = np.expm1(y_pred_log)
 
-        mae = mean_absolute_error(y_test, y_pred)
-        rmse = np.sqrt(mean_squared_error(y_test, y_pred))
-        r2 = r2_score(y_test, y_pred)
+        y_test_real = np.expm1(y_test)
+        mae = mean_absolute_error(y_test_real, y_pred)
+        rmse = np.sqrt(mean_squared_error(y_test_real, y_pred))
+        r2 = r2_score(y_test_real, y_pred)
 
         results.append({
             "Feature Set": feature_set_name,
@@ -241,20 +357,15 @@ def evaluate_models(dataframe, features, feature_set_name):
 
         print(f"\n{model_name}:")
         print(f"  CV R²: {cv_scores.mean():.4f} ± {cv_scores.std():.4f}")
-        print(f"  MAE: {mae:.3f} tỷ VND")
-        print(f"  RMSE: {rmse:.3f} tỷ VND")
+        print(f"  MAE: {mae:.3f} billion VND")
+        print(f"  RMSE: {rmse:.3f} billion VND")
         print(f"  R²: {r2:.4f}")
 
     return results
 
-
 #Run experiments
 
 all_results = []
-
-print("\n" + "#" * 100)
-print("# RUNNING EXPERIMENTS ON CLEANED DATASET")
-print("#" * 100)
 
 # Basic Features
 results_basic = evaluate_models(df, basic_features, "Basic Features (6 features)")
@@ -269,10 +380,9 @@ all_results.extend(results_enhanced)
 
 results_df = pd.DataFrame(all_results)
 
-print("\n" + "=" * 100)
-print("MODEL COMPARISON")
-print("=" * 100)
 print(results_df.to_string(index=False))
+
+#Best model
 
 best_row = results_df.loc[results_df["R2 Score"].idxmax()]
 
@@ -282,14 +392,12 @@ print("=" * 100)
 print(f"Feature Set: {best_row['Feature Set']}")
 print(f"Model: {best_row['Model']}")
 print(f"R² Score: {best_row['R2 Score']}")
-print(f"MAE: {best_row['MAE (billion VND)']} tỷ VND")
-print(f"RMSE: {best_row['RMSE (billion VND)']} tỷ VND")
+print(f"MAE: {best_row['MAE (billion VND)']} billion VND")
+print(f"RMSE: {best_row['RMSE (billion VND)']} billion VND")
 print(f"CV R²: {best_row['CV R2 Mean']:.4f} ± {best_row['CV R2 Std']:.4f}")
 
 #Feature importance from Random Forest
-print("\n" + "=" * 100)
-print("RANDOM FOREST FEATURE IMPORTANCE (Enhanced Features)")
-print("=" * 100)
+print("RANDOM FOREST FEATURE IMPORTANCE")
 
 # Train final Random Forest on full enhanced features
 features_enhanced = [col for col in enhanced_features if col in df.columns]
@@ -331,13 +439,10 @@ importance_df = pd.DataFrame({
 
 print(importance_df.head(15).to_string(index=False))
 
-#Demonstration
+# Demonstration 
 
-print("\n" + "=" * 100)
-print("DEMONSTRATION - INPUT CASES")
-print("=" * 100)
+print("DEMONSTRATION")
 
-# Train final model
 features_enhanced = [col for col in enhanced_features if col in df.columns]
 
 X_enhanced = df[features_enhanced].copy()
@@ -383,7 +488,6 @@ def predict_apartment(input_df):
         if col not in input_df.columns:
             input_df[col] = np.nan
 
-    # Reorder columns
     input_df = input_df[features_enhanced]
 
     prediction = demo_model.predict(input_df)[0]
