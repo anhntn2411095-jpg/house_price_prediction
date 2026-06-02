@@ -1,443 +1,806 @@
-import pandas as pd
-import numpy as np
-
-from sklearn.model_selection import train_test_split, cross_val_score, KFold
-from sklearn.compose import ColumnTransformer
-from sklearn.pipeline import Pipeline
-from sklearn.preprocessing import OneHotEncoder, StandardScaler
-from sklearn.impute import SimpleImputer
-
-from sklearn.linear_model import Ridge
-from sklearn.ensemble import RandomForestRegressor
-
-from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+import asyncio
+import aiohttp
+import csv
+import json
+import logging
+import os
+import random
+import re
+import time
+from dataclasses import dataclass, asdict
+from typing import Any, Optional
 
 
-# ============================================================
-# 1. Display settings
-# ============================================================
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%H:%M:%S",
+)
 
-pd.set_option("display.max_columns", None)
-pd.set_option("display.width", 200)
-
-
-# ============================================================
-# 2. Load dataset
-# ============================================================
-
-path = "housing_chotot_rows.csv"
-
-df = pd.read_csv(path)
-
-print("=" * 100)
-print("ORIGINAL DATASET")
-print("=" * 100)
-print("Original dataset shape:", df.shape)
-
-# ============================================================
-# 3. Basic filtering and cleaning
-# ============================================================
-
-# Keep apartment listings only
-if "category" in df.columns:
-    df = df[df["category"] == "Căn hộ/Chung cư"].copy()
-
-# Keep sale listings only
-if "is_rent" in df.columns:
-    df = df[df["is_rent"] == False].copy()
-
-# Remove rows missing essential values
-df = df.dropna(subset=["price_billion", "area_m2", "district"])
-
-# Remove invalid values
-df = df[
-    (df["price_billion"] > 0) &
-    (df["area_m2"] > 0)
-].copy()
-
-# Create price per m2 in million VND for cleaning only
-if "price_per_m2" in df.columns:
-    df["price_per_m2_million"] = df["price_per_m2"] / 1_000_000
-else:
-    df["price_per_m2_million"] = (
-        df["price_billion"] * 1_000_000_000 / df["area_m2"] / 1_000_000
-    )
-
-# Outlier cleaning
-df = df[
-    (df["area_m2"] >= 15) &
-    (df["area_m2"] <= 300) &
-    (df["price_billion"] >= 0.5) &
-    (df["price_billion"] <= 100) &
-    (df["price_per_m2_million"] >= 10) &
-    (df["price_per_m2_million"] <= 500)
-].copy()
-
-print("\n" + "=" * 100)
-print("AFTER BASIC CLEANING")
-print("=" * 100)
-print("Cleaned dataset shape:", df.shape)
-
-# ============================================================
-# 4. Fix data types and missing values
-# ============================================================
-
-categorical_columns = [
-    "district",
-    "ward",
-    "legal_document",
-    "furnishing",
-    "property_status"
-]
-
-for col in categorical_columns:
-    if col in df.columns:
-        df[col] = df[col].astype("object")
-        df[col] = df[col].where(pd.notna(df[col]), "Unknown")
-        df[col] = df[col].astype(str)
-
-keyword_columns = [
-    "has_full_furniture",
-    "has_balcony",
-    "has_lake_view",
-    "has_city_view",
-    "has_red_book",
-    "has_car_access",
-    "has_luxury_keyword",
-    "has_new_keyword",
-    "has_corner_keyword",
-    "has_near_center"
-]
-
-for col in keyword_columns:
-    if col in df.columns:
-        df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0).astype(int)
-
-numeric_columns = [
-    "area_m2",
-    "latitude",
-    "longitude",
-    "bedrooms",
-    "bathrooms"
-]
-
-for col in numeric_columns:
-    if col in df.columns:
-        df[col] = pd.to_numeric(df[col], errors="coerce")
+log = logging.getLogger(__name__)
 
 
-# ============================================================
-# 5. Define feature sets
-# ============================================================
+# Config
 
-basic_features = [
-    "area_m2",
-    "district",
-    "ward",
-    "latitude",
-    "longitude",
-    "legal_document"
-]
+API_LISTING_URL = "https://gateway.chotot.com/v1/public/ad-listing"
 
-enhanced_features = [
-    "area_m2",
-    "district",
-    "ward",
-    "latitude",
-    "longitude",
-    "legal_document",
-    "bedrooms",
-    "bathrooms",
-    "furnishing",
-    "property_status",
-    "has_full_furniture",
-    "has_balcony",
-    "has_lake_view",
-    "has_city_view",
-    "has_red_book",
-    "has_car_access",
-    "has_luxury_keyword",
-    "has_new_keyword",
-    "has_corner_keyword",
-    "has_near_center"
-]
+HANOI_REGION = 12
 
-# ============================================================
-# 6. Define models
-# ============================================================
+APARTMENT_CATEGORY_ID = 1010
 
-models = {
-    "Ridge Regression": Ridge(alpha=1.0, random_state=42),
-    "Random Forest": RandomForestRegressor(n_estimators=300, random_state=42, n_jobs=-1)
+SALE_STATUS = "s,k"
+
+PAGE_SIZE = 20
+
+TARGET_TOTAL = 2000
+MAX_PAGES = 120
+
+CONCURRENCY = 2
+REQUEST_TIMEOUT = 20
+MIN_DELAY = 2.0
+MAX_DELAY = 5.0
+RETRIES = 3
+
+FETCH_DETAIL = False
+
+OUTPUT_CSV = "chotot_hanoi_apartment_sale_final.csv"
+RAW_SAMPLE_JSON = "raw_ad_samples_debug.json"
+
+HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Student academic project; "
+        "Hanoi apartment price prediction; contact: your_email@example.com)"
+    ),
+    "Accept": "application/json, text/plain, */*",
+    "Referer": "https://nha.chotot.com/",
+    "Origin": "https://nha.chotot.com",
+    "Accept-Language": "vi-VN,vi;q=0.9,en;q=0.8",
 }
 
 
-# ============================================================
-# 7. Preprocessing pipeline
-# ============================================================
+USE_SUPABASE = True
 
-def get_feature_types(X):
-    numerical_features = []
-    categorical_features = []
+SUPABASE_URL = ""
+SUPABASE_KEY = ""
+SUPABASE_TABLE = 'housing_chotot'
 
-    for col in X.columns:
-        if col in categorical_columns:
-            categorical_features.append(col)
-        else:
-            numerical_features.append(col)
+if USE_SUPABASE:
+    if not SUPABASE_URL:
+        raise ValueError("Missing SUPABASE_URL. Please set it as an environment variable.")
 
-    return numerical_features, categorical_features
+    if not SUPABASE_KEY:
+        raise ValueError("Missing SUPABASE_KEY. Please set it as an environment variable.")
 
 
-def build_preprocessor(X):
-    numerical_features, categorical_features = get_feature_types(X)
+# Data model
 
-    numerical_transformer = Pipeline(steps=[
-        ("imputer", SimpleImputer(strategy="median")),
-        ("scaler", StandardScaler())
-    ])
+@dataclass
+class Listing:
+    # Identifier
+    id: int
+    source: str
+    source_url: Optional[str]
 
-    categorical_transformer = Pipeline(steps=[
-        ("imputer", SimpleImputer(strategy="constant", fill_value="Unknown")),
-        ("onehot", OneHotEncoder(handle_unknown="ignore", sparse_output=False))
-    ])
+    # Target variable
+    price_vnd: float
+    price_billion: float
 
-    preprocessor = ColumnTransformer(
-        transformers=[
-            ("num", numerical_transformer, numerical_features),
-            ("cat", categorical_transformer, categorical_features)
-        ]
-    )
+    # Basic property information
+    category: Optional[str]
+    is_rent: bool
+    title: Optional[str]
+    description: Optional[str]
+    area_m2: Optional[float]
+    price_per_m2: Optional[float]  
 
-    return preprocessor, numerical_features, categorical_features
+    # Location
+    region_name: Optional[str]
+    district: Optional[str]
+    ward: Optional[str]
+    latitude: Optional[float]
+    longitude: Optional[float]
 
+    # Structured property features
+    legal_document: Optional[str]
+    bedrooms: Optional[int]
+    bathrooms: Optional[int]
+    floors: Optional[int]
+    furnishing: Optional[str]
+    property_status: Optional[str]
+    seller_type: Optional[str]
+    list_time: Optional[int]
 
-# ============================================================
-# 8. Train and evaluate function
-# ============================================================
+    # Text-derived keyword features
+    has_full_furniture: int
+    has_balcony: int
+    has_lake_view: int
+    has_city_view: int
+    has_red_book: int
+    has_car_access: int
+    has_luxury_keyword: int
+    has_new_keyword: int
+    has_corner_keyword: int
+    has_near_center: int
 
-def evaluate_models(dataframe, features, feature_set_name):
-    features = [col for col in features if col in dataframe.columns]
-
-    X = dataframe[features].copy()
-    X = X.replace({pd.NA: np.nan})
-
-    y = dataframe["price_billion"].copy()
-
-    X_train, X_test, y_train, y_test = train_test_split(
-        X, y, test_size=0.2, random_state=42
-    )
-
-    preprocessor, numerical_features, categorical_features = build_preprocessor(X_train)
-
-    print("\n" + "=" * 100)
-    print(f"FEATURE SET: {feature_set_name}")
-    print("=" * 100)
-    print("Features:", features)
-    print("Numerical features:", numerical_features)
-    print("Categorical features:", categorical_features)
-    print("Train shape:", X_train.shape)
-    print("Test shape:", X_test.shape)
-
-    cv = KFold(n_splits=5, shuffle=True, random_state=42)
-    results = []
-
-    for model_name, model in models.items():
-        pipeline = Pipeline(steps=[
-            ("preprocessor", preprocessor),
-            ("model", model)
-        ])
-
-        # Cross-validation
-        cv_scores = cross_val_score(pipeline, X_train, y_train, cv=cv, scoring='r2', n_jobs=-1)
-
-        # Train
-        pipeline.fit(X_train, y_train)
-        y_pred = pipeline.predict(X_test)
-        y_pred = np.maximum(y_pred, 0)
-
-        mae = mean_absolute_error(y_test, y_pred)
-        rmse = np.sqrt(mean_squared_error(y_test, y_pred))
-        r2 = r2_score(y_test, y_pred)
-
-        results.append({
-            "Feature Set": feature_set_name,
-            "Model": model_name,
-            "CV R2 Mean": cv_scores.mean(),
-            "CV R2 Std": cv_scores.std(),
-            "MAE (billion VND)": round(mae, 3),
-            "RMSE (billion VND)": round(rmse, 3),
-            "R2 Score": round(r2, 4)
-        })
-
-        print(f"\n{model_name}:")
-        print(f"  CV R²: {cv_scores.mean():.4f} ± {cv_scores.std():.4f}")
-        print(f"  MAE: {mae:.3f} tỷ VND")
-        print(f"  RMSE: {rmse:.3f} tỷ VND")
-        print(f"  R²: {r2:.4f}")
-
-    return results
+    def to_row(self) -> dict:
+        return asdict(self)
 
 
-# ============================================================
-# 9. Run experiments
-# ============================================================
+# Helper functions
 
-all_results = []
+def clean_text(value: Any) -> Optional[str]:
+    if value is None:
+        return None
 
-print("\n" + "#" * 100)
-print("# RUNNING EXPERIMENTS ON CLEANED DATASET")
-print("#" * 100)
+    text = str(value)
+    text = re.sub(r"\s+", " ", text).strip()
 
-# Basic Features
-results_basic = evaluate_models(df, basic_features, "Basic Features (6 features)")
-all_results.extend(results_basic)
+    if text == "":
+        return None
 
-# Enhanced Features
-results_enhanced = evaluate_models(df, enhanced_features, "Enhanced Features (22 features)")
-all_results.extend(results_enhanced)
+    return text
 
 
-# ============================================================
-# 10. Final comparison table
-# ============================================================
+def safe_float(value: Any) -> Optional[float]:
+    if value is None or value == "":
+        return None
 
-results_df = pd.DataFrame(all_results)
-
-print("\n" + "=" * 100)
-print("FINAL RESULTS - MODEL COMPARISON")
-print("=" * 100)
-print(results_df.to_string(index=False))
-
-# ============================================================
-# 11. Best model
-# ============================================================
-
-best_row = results_df.loc[results_df["R2 Score"].idxmax()]
-
-print("\n" + "=" * 100)
-print("🏆 BEST MODEL")
-print("=" * 100)
-print(f"Feature Set: {best_row['Feature Set']}")
-print(f"Model: {best_row['Model']}")
-print(f"R² Score: {best_row['R2 Score']}")
-print(f"MAE: {best_row['MAE (billion VND)']} tỷ VND")
-print(f"RMSE: {best_row['RMSE (billion VND)']} tỷ VND")
-print(f"CV R²: {best_row['CV R2 Mean']:.4f} ± {best_row['CV R2 Std']:.4f}")
-
-# ============================================================
-# 12. Feature importance from Random Forest
-# ============================================================
-
-print("\n" + "=" * 100)
-print("RANDOM FOREST FEATURE IMPORTANCE (Enhanced Features)")
-print("=" * 100)
-
-# Train final Random Forest on full enhanced features
-features_enhanced = [col for col in enhanced_features if col in df.columns]
-X_enhanced = df[features_enhanced].copy()
-X_enhanced = X_enhanced.replace({pd.NA: np.nan})
-y = df["price_billion"].copy()
-
-preprocessor, num_features, cat_features = build_preprocessor(X_enhanced)
-
-rf_final = Pipeline(steps=[
-    ("preprocessor", preprocessor),
-    ("model", RandomForestRegressor(n_estimators=300, random_state=42, n_jobs=-1))
-])
-
-rf_final.fit(X_enhanced, y)
-
-# Get feature names after preprocessing
-preprocessor_fitted = rf_final.named_steps["preprocessor"]
-model_fitted = rf_final.named_steps["model"]
-
-feature_names = []
-feature_names.extend(num_features)
-
-if len(cat_features) > 0:
     try:
-        onehot = preprocessor_fitted.named_transformers_["cat"].named_steps["onehot"]
-        cat_names = onehot.get_feature_names_out(cat_features).tolist()
-        feature_names.extend(cat_names)
-    except Exception:
-        pass
+        return float(value)
+    except (TypeError, ValueError):
+        return None
 
-importances = model_fitted.feature_importances_
-min_len = min(len(feature_names), len(importances))
 
-importance_df = pd.DataFrame({
-    "Feature": feature_names[:min_len],
-    "Importance": importances[:min_len]
-}).sort_values(by="Importance", ascending=False)
+def safe_int(value: Any) -> Optional[int]:
+    if value is None or value == "":
+        return None
 
-print(importance_df.head(15).to_string(index=False))
+    try:
+        return int(float(value))
+    except (TypeError, ValueError):
+        return None
 
-# ============================================================
-# 13. Demonstration - Different input cases
-# ============================================================
+# Return the first non-empty value from a list of possible field names
 
-print("\n" + "=" * 100)
-print("DEMONSTRATION - INPUT CASES")
-print("=" * 100)
+def get_first(ad: dict, keys: list[str]) -> Any:
+    for key in keys:
+        value = ad.get(key)
+        if value not in [None, "", [], {}]:
+            return value
 
-# Train final model
-features_enhanced = [col for col in enhanced_features if col in df.columns]
+    return None
 
-X_enhanced = df[features_enhanced].copy()
-X_enhanced = X_enhanced.replace({pd.NA: np.nan})
+# Extract integer values from title/description.
+def extract_int_from_text(text: Optional[str], patterns: list[str]) -> Optional[int]:
+    if not text:
+        return None
 
-y = df["price_billion"].copy()
+    lower_text = text.lower()
 
-demo_preprocessor, _, _ = build_preprocessor(X_enhanced)
+    for pattern in patterns:
+        match = re.search(pattern, lower_text)
+        if match:
+            try:
+                return int(match.group(1))
+            except ValueError:
+                continue
 
-demo_model = Pipeline(steps=[
-    ("preprocessor", demo_preprocessor),
-    ("model", RandomForestRegressor(
-        n_estimators=300,
-        random_state=42,
-        n_jobs=-1
-    ))
-])
+    return None
 
-demo_model.fit(X_enhanced, y)
 
-case_1 = pd.DataFrame([{
-    "area_m2": 75,
-    "district": "Cầu Giấy",
-    "ward": "Dịch Vọng",
-    "latitude": 21.0368,
-    "longitude": 105.7900,
-    "legal_document": "Đã có sổ",
-    "bedrooms": 2,
-    "bathrooms": 2,
-    "furnishing": "Full nội thất",
-    "property_status": "Đã bàn giao",
-    "has_full_furniture": 1,
-    "has_balcony": 1,
-    "has_city_view": 1
-}])
+def keyword_flag(text: Optional[str], keywords: list[str]) -> int:
+    if not text:
+        return 0
 
-def predict_apartment(input_df):
+    lower_text = text.lower()
 
-    print("\nOriginal Input:")
-    print(input_df.to_string(index=False))
+    for keyword in keywords:
+        if keyword.lower() in lower_text:
+            return 1
 
-    # Remove extra columns
-    input_df = input_df[
-        [col for col in input_df.columns if col in features_enhanced]
+    return 0
+
+# Generic reference URL
+def build_source_url(list_id: int) -> str:
+    return f"https://www.chotot.com/{list_id}.htm"
+
+
+def validate_hanoi(ad: dict) -> bool:
+    region = ad.get("region")
+    region_name = str(ad.get("region_name", "")).lower()
+
+    if region is not None:
+        try:
+            return int(region) == HANOI_REGION
+        except (TypeError, ValueError):
+            return False
+
+    return "hà nội" in region_name or "ha noi" in region_name
+
+
+def normalize_legal_document(value: Any) -> Optional[str]:
+    if value is None or value == "":
+        return None
+
+    return str(value)
+
+# Convert one raw listing JSON object into a clean Listing row
+def parse_listing(ad: dict) -> Optional[Listing]:
+
+    if not validate_hanoi(ad):
+        return None
+
+    list_id = get_first(ad, ["list_id", "ad_id", "id"])
+    list_id = safe_int(list_id)
+
+    if list_id is None:
+        return None
+
+    price_vnd = safe_float(get_first(ad, ["price", "price_vnd"]))
+
+    if price_vnd is None or price_vnd <= 0:
+        return None
+
+    area_m2 = safe_float(get_first(ad, [
+        "size",
+        "area",
+        "area_m2",
+        "living_area",
+        "square",
+    ]))
+
+    title = clean_text(get_first(ad, [
+        "subject",
+        "title",
+        "ad_subject",
+    ]))
+
+    description = clean_text(get_first(ad, [
+        "body",
+        "description",
+        "ad_body",
+    ]))
+
+    combined_text = " ".join(
+        part for part in [title, description] if part
+    )
+
+    # Bedrooms
+    bedrooms = safe_int(get_first(ad, [
+        "rooms",
+        "bedrooms",
+        "bedroom",
+        "number_of_bedrooms",
+        "rooms_nb",
+        "room",
+    ]))
+
+    if bedrooms is None:
+        bedrooms = extract_int_from_text(
+            combined_text,
+            [
+                r"(\d+)\s*phòng ngủ",
+                r"(\d+)\s*pn\b",
+                r"(\d+)\s*bedroom",
+            ],
+        )
+
+    bathrooms = safe_int(get_first(ad, [
+        "toilets",
+        "bathrooms",
+        "bathroom",
+        "wc",
+        "number_of_bathrooms",
+        "toilet",
+    ]))
+
+    if bathrooms is None:
+        bathrooms = extract_int_from_text(
+            combined_text,
+            [
+                r"(\d+)\s*phòng tắm",
+                r"(\d+)\s*wc\b",
+                r"(\d+)\s*toilet",
+                r"(\d+)\s*bathroom",
+            ],
+        )
+
+    floors = safe_int(get_first(ad, [
+        "floors",
+        "floor",
+        "number_of_floors",
+        "floors_nb",
+    ]))
+
+    if floors is None:
+        floors = extract_int_from_text(
+            combined_text,
+            [
+                r"(\d+)\s*tầng",
+                r"(\d+)\s*floor",
+            ],
+        )
+
+    legal_document = normalize_legal_document(get_first(ad, [
+        "property_legal_document",
+        "legal_document",
+        "legal_document_name",
+        "property_legal_document_name",
+    ]))
+
+    furnishing = clean_text(get_first(ad, [
+        "furnishing_sell",
+        "furnishing",
+        "furniture_status",
+        "furnishing_name",
+    ]))
+
+    property_status = clean_text(get_first(ad, [
+        "property_status",
+        "property_status_name",
+        "condition",
+        "condition_name",
+    ]))
+
+    seller_type = clean_text(get_first(ad, [
+        "seller_type",
+        "account_type",
+        "seller_type_name",
+    ]))
+
+    list_time = safe_int(get_first(ad, [
+        "list_time",
+        "date",
+        "created_at",
+        "timestamp",
+    ]))
+
+    latitude = safe_float(get_first(ad, ["latitude", "lat"]))
+    longitude = safe_float(get_first(ad, ["longitude", "lng", "lon"]))
+
+    price_per_m2 = None
+    if area_m2 is not None and area_m2 > 0:
+        price_per_m2 = price_vnd / area_m2
+
+    price_billion = price_vnd / 1_000_000_000
+
+    return Listing(
+        id=list_id,
+        source="chotot_gateway",
+        source_url=build_source_url(list_id),
+
+        price_vnd=price_vnd,
+        price_billion=price_billion,
+
+        category=clean_text(get_first(ad, ["category_name", "category"])),
+        is_rent=False,
+        title=title,
+        description=description,
+        area_m2=area_m2,
+        price_per_m2=price_per_m2,
+
+        region_name=clean_text(ad.get("region_name")),
+        district=clean_text(get_first(ad, ["area_name", "district", "district_name"])),
+        ward=clean_text(get_first(ad, ["ward_name", "ward"])),
+
+        latitude=latitude,
+        longitude=longitude,
+
+        legal_document=legal_document,
+        bedrooms=bedrooms,
+        bathrooms=bathrooms,
+        floors=floors,
+        furnishing=furnishing,
+        property_status=property_status,
+        seller_type=seller_type,
+        list_time=list_time,
+
+        has_full_furniture=keyword_flag(
+            combined_text,
+            [
+                "full nội thất",
+                "đầy đủ nội thất",
+                "nội thất cao cấp",
+                "full nt",
+                "full đồ",
+            ],
+        ),
+        has_balcony=keyword_flag(
+            combined_text,
+            [
+                "ban công",
+                "balcony",
+                "logia",
+            ],
+        ),
+        has_lake_view=keyword_flag(
+            combined_text,
+            [
+                "view hồ",
+                "nhìn hồ",
+                "hồ tây",
+                "hồ gươm",
+                "view sông",
+            ],
+        ),
+        has_city_view=keyword_flag(
+            combined_text,
+            [
+                "view thành phố",
+                "city view",
+                "view đẹp",
+                "view thoáng",
+            ],
+        ),
+        has_red_book=keyword_flag(
+            combined_text,
+            [
+                "sổ đỏ",
+                "sổ hồng",
+                "pháp lý đầy đủ",
+                "pháp lý rõ ràng",
+                "có sổ",
+            ],
+        ),
+        has_car_access=keyword_flag(
+            combined_text,
+            [
+                "ô tô",
+                "oto",
+                "gara",
+                "đỗ xe",
+                "hầm để xe",
+                "chỗ để xe",
+            ],
+        ),
+        has_luxury_keyword=keyword_flag(
+            combined_text,
+            [
+                "cao cấp",
+                "luxury",
+                "sang trọng",
+                "đẳng cấp",
+                "penthouse",
+                "duplex",
+                "residence",
+            ],
+        ),
+        has_new_keyword=keyword_flag(
+            combined_text,
+            [
+                "mới",
+                "nhà mới",
+                "vừa bàn giao",
+                "mới nhận nhà",
+                "chưa ở",
+            ],
+        ),
+        has_corner_keyword=keyword_flag(
+            combined_text,
+            [
+                "căn góc",
+                "góc",
+                "2 mặt thoáng",
+                "hai mặt thoáng",
+            ],
+        ),
+        has_near_center=keyword_flag(
+            combined_text,
+            [
+                "trung tâm",
+                "gần phố",
+                "gần trường",
+                "gần bệnh viện",
+                "gần metro",
+                "gần hồ",
+                "gần công viên",
+            ],
+        ),
+    )
+
+
+# Crawl state
+class CrawlState:
+    def __init__(self, target: int):
+        self.target = target
+        self.seen_ids: set[int] = set()
+        self.total = 0
+        self.lock = asyncio.Lock()
+        self.done = False
+
+    async def register(self, listings: list[Listing]) -> list[Listing]:
+        async with self.lock:
+            if self.done:
+                return []
+
+            new_listings = []
+
+            for listing in listings:
+                if listing.id not in self.seen_ids:
+                    self.seen_ids.add(listing.id)
+                    new_listings.append(listing)
+
+            self.total += len(new_listings)
+
+            if self.total >= self.target:
+                self.done = True
+
+            return new_listings
+
+
+class OptionalSupabaseWriter:
+    def __init__(self):
+        self.enabled = False
+        self.client = None
+        self.written = 0
+        self.lock = asyncio.Lock()
+
+        if USE_SUPABASE:
+            if not SUPABASE_URL or not SUPABASE_KEY:
+                raise RuntimeError(
+                    "USE_SUPABASE=True but SUPABASE_URL or SUPABASE_KEY is missing."
+                )
+
+            try:
+                from supabase import create_client
+            except ImportError as error:
+                raise RuntimeError(
+                    "Supabase package is not installed. Run: pip install supabase"
+                ) from error
+
+            self.client = create_client(SUPABASE_URL, SUPABASE_KEY)
+            self.enabled = True
+
+    async def upsert(self, rows: list[dict]):
+        if not self.enabled or not rows:
+            return
+
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(None, self._upsert_sync, rows)
+
+        async with self.lock:
+            self.written += len(rows)
+
+        log.info(f"Supabase rows written so far: {self.written}")
+
+    def _upsert_sync(self, rows: list[dict]):
+        self.client.table(SUPABASE_TABLE).upsert(rows, on_conflict="id").execute()
+
+
+# Network functions
+
+async def polite_sleep():
+    await asyncio.sleep(random.uniform(MIN_DELAY, MAX_DELAY))
+
+
+async def fetch_json(
+    session: aiohttp.ClientSession,
+    url: str,
+    params: Optional[dict] = None,
+    retries: int = RETRIES,
+) -> Optional[dict]:
+    for attempt in range(retries):
+        try:
+            async with session.get(
+                url,
+                params=params,
+                headers=HEADERS,
+                timeout=aiohttp.ClientTimeout(total=REQUEST_TIMEOUT),
+            ) as response:
+
+                if response.status in [401, 403, 404, 429]:
+                    text = await response.text()
+                    log.warning(
+                        f"Stop-like status {response.status}. "
+                        f"URL={response.url}. Response preview={text[:120]}"
+                    )
+                    return None
+
+                # Retry only server-side errors
+                if response.status >= 500:
+                    raise aiohttp.ClientResponseError(
+                        response.request_info,
+                        response.history,
+                        status=response.status,
+                        message="Server error",
+                        headers=response.headers,
+                    )
+
+                response.raise_for_status()
+                return await response.json(content_type=None)
+
+        except Exception as error:
+            wait = (2 ** attempt) + random.uniform(0, 1)
+            log.warning(f"Retry {attempt + 1}/{retries} in {wait:.1f}s | {error}")
+            await asyncio.sleep(wait)
+
+    return None
+
+
+async def fetch_listing_page(
+    session: aiohttp.ClientSession,
+    offset: int,
+) -> list[dict]:
+    params = {
+        "cg": APARTMENT_CATEGORY_ID,
+        "o": offset,
+        "limit": PAGE_SIZE,
+        "st": SALE_STATUS,
+        "region": HANOI_REGION,
+        "key_param_included": "true",
+    }
+
+    data = await fetch_json(session, API_LISTING_URL, params=params)
+
+    if not data:
+        return []
+
+    ads = data.get("ads", [])
+
+    if not isinstance(ads, list):
+        return []
+
+    return ads
+
+def save_csv(rows: list[dict], output_file: str):
+    if not rows:
+        log.warning("No rows to save.")
+        return
+
+    fieldnames = list(rows[0].keys())
+
+    with open(output_file, "w", newline="", encoding="utf-8-sig") as file:
+        writer = csv.DictWriter(file, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+
+    log.info(f"Saved {len(rows)} rows to {output_file}")
+
+
+def save_raw_samples(raw_samples: list[dict], output_file: str):
+    if not raw_samples:
+        return
+
+    with open(output_file, "w", encoding="utf-8") as file:
+        json.dump(raw_samples, file, ensure_ascii=False, indent=2)
+
+    log.info(f"Saved raw debug samples to {output_file}")
+
+
+# Data quality report
+def print_quality_report(rows: list[dict]):
+    if not rows:
+        return
+
+    try:
+        import pandas as pd
+    except ImportError:
+        log.info("pandas not installed, skipping quality report.")
+        return
+
+    df = pd.DataFrame(rows)
+
+    print("\n" + "=" * 70)
+    print("DATA QUALITY REPORT")
+    print("=" * 70)
+
+    print("\nShape:")
+    print(df.shape)
+
+    print("\nMissing values (%):")
+    missing = df.isna().mean().sort_values(ascending=False) * 100
+    print(missing.round(2))
+
+    print("\nPrice summary, billion VND:")
+    print(df["price_billion"].describe())
+
+    print("\nArea summary, m2:")
+    print(df["area_m2"].describe())
+
+    if "price_per_m2" in df.columns:
+        df["price_per_m2_million"] = df["price_per_m2"] / 1_000_000
+        print("\nPrice per m2 summary, million VND/m2:")
+        print(df["price_per_m2_million"].describe())
+
+    print("\nDistrict counts:")
+    print(df["district"].value_counts(dropna=False).head(20))
+
+    useful_cols = [
+        "bedrooms",
+        "bathrooms",
+        "floors",
+        "furnishing",
+        "legal_document",
+        "has_full_furniture",
+        "has_balcony",
+        "has_lake_view",
+        "has_luxury_keyword",
+        "has_red_book",
+        "has_car_access",
     ]
 
-    # Add missing columns
-    for col in features_enhanced:
-        if col not in input_df.columns:
-            input_df[col] = np.nan
+    print("\nUseful feature availability:")
+    for col in useful_cols:
+        if col in df.columns:
+            non_missing = df[col].notna().mean() * 100
+            print(f"{col}: {non_missing:.2f}% non-missing")
 
-    # Reorder columns
-    input_df = input_df[features_enhanced]
+    print("\nPreview:")
+    print(df.head())
 
-    prediction = demo_model.predict(input_df)[0]
 
-    print(f"\nPredicted Price: {prediction:.2f} billion VND")
+# Main crawler
 
-predict_apartment(case_1)
+async def crawl_apartment_sale():
+    start_time = time.time()
+
+    state = CrawlState(target=TARGET_TOTAL)
+    writer = OptionalSupabaseWriter()
+
+    all_rows: list[dict] = []
+    raw_samples: list[dict] = []
+
+    connector = aiohttp.TCPConnector(limit=CONCURRENCY * 2)
+
+    async with aiohttp.ClientSession(headers=HEADERS, connector=connector) as session:
+        offset = 0
+        page = 0
+
+        while page < MAX_PAGES and not state.done:
+            log.info(f"Fetching listing page {page + 1}, offset={offset}")
+
+            ads = await fetch_listing_page(session, offset=offset)
+            await polite_sleep()
+
+            if not ads:
+                log.info("No more ads returned. Stopping.")
+                break
+
+            if len(raw_samples) < 5:
+                remaining = 5 - len(raw_samples)
+                raw_samples.extend(ads[:remaining])
+
+            parsed_listings: list[Listing] = []
+
+            for ad in ads:
+                listing = parse_listing(ad)
+
+                if listing:
+                    parsed_listings.append(listing)
+
+            new_listings = await state.register(parsed_listings)
+
+            if new_listings:
+                rows = [listing.to_row() for listing in new_listings]
+                all_rows.extend(rows)
+                await writer.upsert(rows)
+
+            log.info(
+                f"Page={page + 1:<3} raw={len(ads):<3} "
+                f"parsed={len(parsed_listings):<3} "
+                f"new={len(new_listings):<3} total={state.total}"
+            )
+
+            offset += PAGE_SIZE
+            page += 1
+
+            if len(ads) < PAGE_SIZE:
+                log.info("Last page reached because returned ads < PAGE_SIZE.")
+                break
+
+    save_csv(all_rows, OUTPUT_CSV)
+    save_raw_samples(raw_samples, RAW_SAMPLE_JSON)
+    print_quality_report(all_rows)
+
+    elapsed = time.time() - start_time
+
+    log.info("=" * 70)
+    log.info(f"Finished. Total rows collected: {len(all_rows)}")
+    log.info(f"Time elapsed: {elapsed:.0f} seconds")
+    log.info(f"Raw debug sample: {RAW_SAMPLE_JSON}")
+
+    if USE_SUPABASE:
+        log.info(f"Supabase rows written: {writer.written}")
+
+if __name__ == "__main__":
+    asyncio.run(crawl_apartment_sale())
