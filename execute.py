@@ -76,14 +76,12 @@ exact_duplicate_cols = [
 exact_duplicate_cols = [col for col in exact_duplicate_cols if col in df.columns]
 
 before_exact_duplicate_removal = len(df)
-exact_duplicate_percentage = exact_duplicate_count / before_exact_duplicate_removal * 100
 
 df = df.drop_duplicates(subset=exact_duplicate_cols, keep="first").copy()
 
 after_exact_duplicate_removal = len(df)
 
 print("Exact duplicate columns:", exact_duplicate_cols)
-print(f"Exact duplicate percentage: {exact_duplicate_percentage:.2f}%")
 print("Cleaned dataset shape after exact duplicate removal:", df.shape)
 
 
