@@ -370,7 +370,7 @@ results_basic = evaluate_models(df, basic_features, "Basic Features (6 features)
 all_results.extend(results_basic)
 
 # Enhanced Features
-results_enhanced = evaluate_models(df, enhanced_features, "Enhanced Features (22 features)")
+results_enhanced = evaluate_models(df, enhanced_features, "Enhanced Features (20 features)")
 all_results.extend(results_enhanced)
 
 
